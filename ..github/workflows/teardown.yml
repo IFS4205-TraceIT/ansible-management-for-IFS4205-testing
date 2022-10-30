@@ -1,0 +1,122 @@
+name: Teardown from environment
+on:
+  workflow_dispatch:
+    inputs:
+      deploy_environment:
+        type: choice
+        description: Do you want to teardown from dev or prod?
+        required: true
+        options: 
+        - dev
+        - prod
+
+jobs:
+
+  coordinator:
+    runs-on: ci
+    steps:
+
+      - name: Configure runner settings
+        id: runner-settings
+        shell: bash
+        run: |
+          if [[ "${{ inputs.deploy_environment }}" == "prod" ]]; then
+            echo 'RUNNER_LABEL=cd' >> $GITHUB_OUTPUT
+            echo 'CONTAINER_OPTIONS=--dns 137.132.90.2 --dns 137.132.85.2 --dns 8.8.8.8' >> $GITHUB_OUTPUT
+          else
+            echo 'RUNNER_LABEL=cd-test' >> $GITHUB_OUTPUT
+            echo 'CONTAINER_OPTIONS=--dns 192.168.1.101 --dns 8.8.8.8' >> $GITHUB_OUTPUT
+          fi
+    
+    outputs:
+      RUNNER_LABEL: "${{ steps.runner-settings.outputs.RUNNER_LABEL }}"
+      CONTAINER_OPTIONS: "${{ steps.runner-settings.outputs.CONTAINER_OPTIONS }}"
+
+  teardown:
+    needs: coordinator
+    concurrency: ${{ inputs.deploy_environment }}
+    runs-on: ${{ needs.coordinator.outputs.RUNNER_LABEL }}
+    container: 
+      image: willhallonline/ansible:2.12-ubuntu-20.04
+      options: ${{ needs.coordinator.outputs.CONTAINER_OPTIONS }}
+
+    steps:
+      - name: Check if Telegram secrets are set
+        id: telegram
+        shell: bash
+        run: |
+          if [[ "${{ secrets.TELEGRAM_TO }}" != "" && "${{ secrets.TELEGRAM_TOKEN }}" != "" ]]; then
+            echo 'ENABLED=true' >> $GITHUB_OUTPUT
+          else
+            echo 'ENABLED=false' >> $GITHUB_OUTPUT
+          fi
+
+      - name: Send alert to Telegram chat
+        if: inputs.deploy_environment == 'prod' && steps.telegram.outputs.ENABLED == 'true'
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_TO }}
+          token: ${{ secrets.TELEGRAM_TOKEN }}
+          message: "✔️ Teardown from production servers successfully initiated."
+
+      - name: Cleanup build folder
+        run: |
+          ls -la ./
+          rm -rf ./* || true
+          rm -rf ./.??* || true
+          ls -la ./
+
+      - name: Check installation
+        run: |
+          ansible --version
+
+      - name: Clone repo
+        uses: actions/checkout@v3
+
+      - name: Teardown tracer_backend
+        uses: dawidd6/action-ansible-playbook@v2
+        env:
+          APP_HOSTS: traceit-01-i.comp.nus.edu.sg
+        with:
+          playbook: playbooks/teardown_django.yml
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          options: |
+            --inventory hosts_prod.yml
+      
+      - name: Teardown research_backend
+        uses: dawidd6/action-ansible-playbook@v2
+        env:
+          APP_HOSTS: traceit-02-i.comp.nus.edu.sg
+        with:
+          playbook: playbooks/teardown_django.yml
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          options: |
+            --inventory hosts_prod.yml
+
+      - name: Teardown contact_backend
+        uses: dawidd6/action-ansible-playbook@v2
+        env:
+          APP_HOSTS: traceit-03-i.comp.nus.edu.sg
+        with:
+          playbook: playbooks/teardown_django.yml
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          options: |
+            --inventory hosts_prod.yml
+
+      - name: Teardown Database 1
+        uses: dawidd6/action-ansible-playbook@v2
+        env:
+          DB_HOSTS: traceit-01-i.comp.nus.edu.sg
+        with:
+          playbook: playbooks/teardown_postgres.yml
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          options: |
+            --inventory hosts_prod.yml
+
+      - name: Teardown proxy
+        uses: dawidd6/action-ansible-playbook@v2
+        with:
+          playbook: playbooks/teardown_nginx.yml
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          options: |
+            --inventory hosts_prod.yml

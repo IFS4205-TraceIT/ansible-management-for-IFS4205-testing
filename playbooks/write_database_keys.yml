@@ -1,0 +1,26 @@
+- name: Write database secrets to Vault
+  hosts: vault
+  gather_facts: no
+  become: yes
+  become_user: vault
+
+  environment:
+    VAULT_TOKEN: "{{ lookup('ansible.builtin.env', 'VAULT_TOKEN') }}"
+    VAULT_ADDR: "{{ lookup('ansible.builtin.env', 'VAULT_ADDR') }}"
+    VAULT_CLIENT_CERT: /opt/vault/tls/tls.crt
+    VAULT_CLIENT_KEY: /opt/vault/tls/tls.key
+    VAULT_CACERT: /usr/local/share/ca-certificates/traceit-ca.crt
+
+  tasks:
+
+    - name: Write database secrets
+      ansible.builtin.command:
+        argv:
+          - vault
+          - kv
+          - put
+          - -mount=kv
+          - "{{ lookup('ansible.builtin.env', 'DATABASE_NAME') }}"
+          - tde_key={{ lookup('ansible.builtin.password', '/dev/null chars=hexdigits length=32') }}
+          - root_password={{ lookup('ansible.builtin.password', '/dev/null chars=ascii_lowercase,ascii_uppercase,digits length=32') }}
+

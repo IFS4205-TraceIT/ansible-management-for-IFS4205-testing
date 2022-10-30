@@ -1,0 +1,69 @@
+name: Unseal Vault
+on:
+  workflow_dispatch:
+    inputs:
+      deploy_environment:
+        type: choice
+        description: Do you want to unseal the vault in dev or prod?
+        required: true
+        options: 
+        - dev
+        - prod
+
+      unseal_key:
+        type: string
+        description: Key used to unseal the vault
+        required: true
+
+jobs:
+
+  coordinator:
+    runs-on: ci
+    steps:
+
+      - name: Configure runner settings
+        id: runner-settings
+        run: |
+          if [[ "${{ inputs.deploy_environment }}" == "prod" ]]; then
+            echo 'RUNNER_LABEL=cd' >> $GITHUB_OUTPUT
+            echo 'CONTAINER_OPTIONS=--dns 137.132.90.2 --dns 137.132.85.2 --dns 8.8.8.8' >> $GITHUB_OUTPUT
+          else
+            echo 'RUNNER_LABEL=cd-test' >> $GITHUB_OUTPUT
+            echo 'CONTAINER_OPTIONS=--dns 192.168.1.101 --dns 8.8.8.8' >> $GITHUB_OUTPUT
+          fi
+    
+    outputs:
+      RUNNER_LABEL: "${{ steps.runner-settings.outputs.RUNNER_LABEL }}"
+      CONTAINER_OPTIONS: "${{ steps.runner-settings.outputs.CONTAINER_OPTIONS }}"
+  
+  unseal:
+    needs: coordinator
+    runs-on: ${{ needs.coordinator.outputs.RUNNER_LABEL }}
+    container: 
+      image: willhallonline/ansible:2.12-ubuntu-20.04
+      options: ${{ needs.coordinator.outputs.CONTAINER_OPTIONS }}
+
+    steps:
+      - name: Cleanup build folder
+        run: |
+          ls -la ./
+          rm -rf ./* || true
+          rm -rf ./.??* || true
+          ls -la ./
+
+      - name: Check installation
+        run: |
+          ansible --version
+
+      - name: Clone repo
+        uses: actions/checkout@v3
+
+      - name: Unseal Vault
+        uses: dawidd6/action-ansible-playbook@v2
+        env:
+          UNSEAL_KEY: ${{ inputs.unseal_key }}
+        with:
+          playbook: playbooks/unseal_vault.yml
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          options: |
+            --inventory hosts_prod.yml

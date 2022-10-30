@@ -1,0 +1,200 @@
+- name: Configure PKI engine in Vault
+  hosts: vault
+  gather_facts: no
+  become: yes
+  become_user: vault
+
+  environment:
+    VAULT_SKIP_VERIFY: true
+    VAULT_TOKEN: "{{ lookup('ansible.builtin.env', 'VAULT_TOKEN') }}"
+    VAULT_ADDR: "https://traceit-07-i.comp.nus.edu.sg:8200"    
+
+  tasks:
+
+    - name: Unseal vault
+      ansible.builtin.uri:
+        url: "https://traceit-07-i.comp.nus.edu.sg:8200/v1/sys/unseal"
+        method: POST
+        body:
+          key: "{{ lookup('ansible.builtin.env', 'UNSEAL_KEY') }}"
+        body_format: json
+        headers:
+          Content-Type: "application/json"
+        validate_certs: no
+
+    - name: Enable PKI Secrets Engine for Root CA
+      ansible.builtin.command:
+        argv:
+          - vault
+          - secrets
+          - enable
+          - pki
+      ignore_errors: yes
+
+    - name: Enable PKI Secrets Engine for Intermediate CA
+      ansible.builtin.command:
+        argv:
+          - vault
+          - secrets
+          - enable
+          - -path=pki_int
+          - pki
+      ignore_errors: yes
+
+    - name: Tune PKI secrets engine for Root CA
+      ansible.builtin.command:
+        argv:
+          - vault
+          - secrets
+          - tune
+          - -max-lease-ttl=87600h
+          - pki
+    
+    - name: Tune PKI secrets engine for Intermediate CA
+      ansible.builtin.command:
+        argv:
+          - vault
+          - secrets
+          - tune
+          - -max-lease-ttl=43800h
+          - pki_int
+
+    - name: Create Root CA
+      ansible.builtin.command:
+        argv:
+          - vault
+          - write
+          - pki/root/generate/internal
+          - common_name=TraceIT Root CA
+          - issuer_name=traceit-root-ca
+          - ttl=87600h
+          - key_bits=4096
+      ignore_errors: yes
+    
+    - name: Configure CA and CRL URLs
+      ansible.builtin.command:
+        argv:
+          - vault
+          - write
+          - pki/config/urls
+          - issuing_certificates=https://traceit-07-i.comp.nus.edu.sg:8200/v1/pki/ca
+          - crl_distribution_points=https://traceit-07-i.comp.nus.edu.sg:8200/v1/pki/crl
+    
+    - name: Generate Intermediate CA's CSR
+      ansible.builtin.command:
+        argv:
+          - vault
+          - write
+          - -format=json
+          - pki_int/intermediate/generate/internal
+          - common_name=TraceIT Intermediate CA
+          - issuer_name=traceit-intermediate-ca
+          - key_bits=4096
+      register: csr_output
+    
+    - name: Generate Intermediate CA's certificate by signing Intermediate CA's CSR
+      ansible.builtin.command:
+        argv:
+          - vault
+          - write
+          - -format=json
+          - pki/root/sign-intermediate
+          - issuer_ref=traceit-root-ca
+          - csr={{ csr_output.stdout | from_json | json_query('data.csr') }}
+          - format=pem_bundle
+          - ttl=43800h
+      register: cert_output
+
+    - name: Import Intermediate CA's certificate
+      ansible.builtin.command:
+        argv:
+          - vault
+          - write
+          - pki_int/intermediate/set-signed
+          - certificate={{ cert_output.stdout | from_json | json_query('data.certificate') }}
+
+    - name: Get Intermediate CA's issuer
+      ansible.builtin.command:
+        argv:
+          - vault
+          - read
+          - -field=default
+          - pki_int/config/issuers
+      register: issuer_output
+
+    - name: Create roles for traceit-01-i to traceit-07-i
+      loop:
+        - traceit-01-i
+        - traceit-02-i
+        - traceit-03-i
+        - traceit-04-i
+        - traceit-05-i
+        - traceit-06-i
+        - traceit-07-i
+      ansible.builtin.command:
+        argv:
+          - vault
+          - write
+          - pki_int/roles/{{ item }}.comp.nus.edu.sg
+          - issuer_ref={{ issuer_output.stdout }}
+          - allowed_domains=comp.nus.edu.sg
+          - allow_subdomains=true
+          - max_ttl=768h
+          - key_bits=4096
+
+- name: Install CA's certificate to trust store
+  hosts: all
+  gather_facts: no
+  become: yes
+
+  tasks:
+
+    - name: Request Intermediate CA's certificate
+      community.hashi_vault.vault_read:
+        url: "https://traceit-07-i.comp.nus.edu.sg:8200"
+        path: pki_int/cert/ca_chain
+        auth_method: token
+        token: "{{ lookup('ansible.builtin.env', 'VAULT_TOKEN') }}"
+        validate_certs: no
+        token_validate: false
+      register: ca_certificate_output
+
+    - name: Write certificate to disk
+      ansible.builtin.copy:
+        dest: /usr/local/share/ca-certificates/traceit-ca.crt
+        content: "{{ ca_certificate_output.data.data.ca_chain }}"
+    
+    - name: Update trust store
+      ansible.builtin.command:
+        argv:
+          - update-ca-certificates
+
+- name: Insert certs for django
+  ansible.builtin.import_playbook: install_clientcert.yml
+  vars:
+    service_hosts: django
+    service_user: django
+
+- name: Insert certs for postgres
+  ansible.builtin.import_playbook: install_clientcert.yml
+  vars:
+    service_hosts: postgresql
+    service_user: postgres
+
+- name: Insert certs for nginx
+  ansible.builtin.import_playbook: install_clientcert.yml
+  vars:
+    service_hosts: nginx
+    service_user: root
+
+- name: Insert certs for cicd
+  ansible.builtin.import_playbook: install_clientcert.yml
+  vars:
+    service_hosts: cicd
+    service_user: cicd
+
+- name: Insert certs for vault
+  ansible.builtin.import_playbook: install_clientcert.yml
+  vars:
+    service_hosts: vault
+    service_user: vault

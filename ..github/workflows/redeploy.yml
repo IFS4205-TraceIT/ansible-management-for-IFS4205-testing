@@ -1,0 +1,331 @@
+name: Redeploy web services that are down
+on:
+  schedule:
+    # Set to run at HH:00 and HH:30
+    - cron: '0,30 * * * *' 
+
+  workflow_dispatch:
+
+jobs:
+  redeploy:
+
+    concurrency: prod
+    runs-on: cd
+    container: 
+      image: willhallonline/ansible:2.12-ubuntu-20.04
+      options: --dns 137.132.90.2 --dns 137.132.85.2 --dns 8.8.8.8
+      volumes:
+        - /usr/local/share/ca-certificates/traceit-ca.crt:/traceit-ca.crt
+        - /home/cicd/server.crt:/server.crt
+        - /home/cicd/server.key:/server.key
+
+    steps:
+
+      - name: Cleanup folder
+        run: |
+          rm -rf ./* || true
+          rm -rf ./.??* || true
+
+      - name: Retrieve relevant secrets
+        id: secrets
+        shell: bash
+        run: |
+          echo 'VAULT_TOKEN=${{ secrets.VAULT_TOKEN_PROD }}' >> $GITHUB_OUTPUT
+          
+          # Redact Vault keys and certs
+          echo "::add-mask::$VAULT_CACERT"
+          echo "::add-mask::$VAULT_CLIENTCERT"
+          echo "::add-mask::$VAULT_CLIENTKEY"
+
+          echo "VAULT_CACERT=$VAULT_CACERT" >> $GITHUB_OUTPUT
+          echo "VAULT_CLIENTCERT=$VAULT_CLIENTCERT" >> $GITHUB_OUTPUT
+          echo "VAULT_CLIENTKEY=$VAULT_CLIENTKEY" >> $GITHUB_OUTPUT
+
+      - name: Clone repository
+        uses: actions/checkout@v3        
+      
+      - name: Install curl
+        run: |
+          apt-get update
+          apt-get install -y curl
+
+      ######################################
+      #           Reverse Proxy            #
+      ######################################
+
+      - name: Check if reverse proxy is down
+        id: proxy-status
+        shell: bash
+        run: |
+          STATUSCODE=$(curl -I --silent --output /dev/stderr --max-time 10 --write-out "%{http_code}"  http://traceit-04-i.comp.nus.edu.sg/ || true)
+          if [[ "$STATUSCODE" == "000" ]]; then
+            echo 'DOWN=true' >> $GITHUB_OUTPUT
+          else
+            echo 'DOWN=false' >> $GITHUB_OUTPUT
+          fi
+
+      - name: Teardown reverse proxy
+        if: steps.proxy-status.outputs.DOWN == 'true'
+        uses: dawidd6/action-ansible-playbook@v2
+        with:
+          playbook: playbooks/teardown_nginx.yml
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          options: |
+            --inventory hosts_prod.yml
+      
+      - name: Download tracer_frontend release
+        if: steps.proxy-status.outputs.DOWN == 'true'
+        uses: dsaltares/fetch-gh-release-asset@master
+        with:
+          repo: IFS4205-TraceIT/tracer-frontend
+          version: tags/vlatest
+          file: tracer-frontend.tar.gz 
+          token: ${{ secrets.PAT }}
+          target: playbooks/files/tracer-frontend.tar.gz
+
+      - name: Download research_frontend release
+        if: steps.proxy-status.outputs.DOWN == 'true'
+        uses: dsaltares/fetch-gh-release-asset@master
+        with:
+          repo: IFS4205-TraceIT/research-frontend
+          version: tags/vlatest
+          file: research-frontend.tar.gz 
+          token: ${{ secrets.PAT }}
+          target: playbooks/files/research-frontend.tar.gz
+        
+      - name: Deploy proxy
+        if: steps.proxy-status.outputs.DOWN == 'true'
+        uses: dawidd6/action-ansible-playbook@v2
+        with:
+          playbook: playbooks/deploy_nginx.yml
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          options: |
+            --inventory hosts_prod.yml
+
+      ######################################
+      #            Tracer API              #
+      ######################################
+
+      - name: Check if tracer API is down
+        id: tracer-status
+        shell: bash
+        run: |
+          STATUSCODE=$(curl -I --silent --output /dev/stderr --max-time 10 --write-out "%{http_code}"  http://traceit-04-i.comp.nus.edu.sg/tracer/api/ || true)
+          if [[ "$STATUSCODE" == "502" ]]; then
+            echo 'DOWN=true' >> $GITHUB_OUTPUT
+          else
+            echo 'DOWN=false' >> $GITHUB_OUTPUT
+          fi
+
+      - name: Teardown tracer_backend
+        if: steps.tracer-status.outputs.DOWN == 'true'
+        uses: dawidd6/action-ansible-playbook@v2
+        env:
+          APP_HOSTS: traceit-01-i.comp.nus.edu.sg
+        with:
+          playbook: playbooks/teardown_django.yml
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          options: |
+            --inventory hosts_prod.yml
+      
+      - name: Get tracer_backend secrets from Vault
+        if: steps.tracer-status.outputs.DOWN == 'true'
+        uses: hashicorp/vault-action@v2.4.0
+        id: tracer_backend-secrets
+        with:
+          url: https://traceit-07-i.comp.nus.edu.sg:8200
+          token: ${{ steps.secrets.outputs.VAULT_TOKEN }}
+          secrets: |
+              kv/tracer_backend secret_key | DJANGO_SECRET_KEY;
+              database/creds/authdb_readwrite username | POSTGRES_AUTH_USER;
+              database/creds/authdb_readwrite password | POSTGRES_AUTH_PASSWORD;
+              database/creds/maindb_readwrite username | POSTGRES_USER;
+              database/creds/maindb_readwrite password | POSTGRES_PASSWORD;
+          exportEnv: false
+          caCertificate: ${{ steps.secrets.outputs.VAULT_CACERT }}
+          clientCertificate: ${{ steps.secrets.outputs.VAULT_CLIENTCERT }}
+          clientKey: ${{ steps.secrets.outputs.VAULT_CLIENTKEY }}
+
+      - name: Deploy tracer_backend
+        if: steps.tracer-status.outputs.DOWN == 'true'
+        uses: dawidd6/action-ansible-playbook@v2
+        env:
+          APP_HOSTS: traceit-01-i.comp.nus.edu.sg
+          PAT: ${{ secrets.PAT }}
+          REPOSITORY: "IFS4205-TraceIT/tracer-backend"
+          APP_NAME: tracer_backend
+          DJANGO_SECRET_KEY: "${{ steps.tracer_backend-secrets.outputs.DJANGO_SECRET_KEY }}"
+
+          VAULT_TOKEN: ${{ steps.secrets.outputs.VAULT_TOKEN }}
+          VAULT_ADDR: https://traceit-07-i.comp.nus.edu.sg:8200
+
+          POSTGRES_AUTH_HOST:     traceit-01-i.comp.nus.edu.sg
+          POSTGRES_AUTH_PORT:     5432
+          POSTGRES_AUTH_DB:       authdb
+          POSTGRES_AUTH_USER:     "${{ steps.tracer_backend-secrets.outputs.POSTGRES_AUTH_USER }}"
+          POSTGRES_AUTH_PASSWORD: "${{ steps.tracer_backend-secrets.outputs.POSTGRES_AUTH_PASSWORD }}"
+
+          POSTGRES_HOST:          traceit-01-i.comp.nus.edu.sg
+          POSTGRES_PORT:          5432
+          POSTGRES_DB:            maindb
+          POSTGRES_USER:          "${{ steps.tracer_backend-secrets.outputs.POSTGRES_USER }}"
+          POSTGRES_PASSWORD:      "${{ steps.tracer_backend-secrets.outputs.POSTGRES_PASSWORD }}"
+
+          LOKI_PASSWD:            ${{ secrets.LOKI_PASSWD }}
+        with:
+          playbook: playbooks/deploy_django.yml
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          options: |
+            --inventory hosts_prod.yml
+
+      ######################################
+      #           Research API             #
+      ######################################
+
+      - name: Check if research API is down
+        id: research-status
+        shell: bash
+        run: |
+          STATUSCODE=$(curl -I --silent --output /dev/stderr --max-time 10 --write-out "%{http_code}"  http://traceit-04-i.comp.nus.edu.sg/research/api/ || true)
+          if [[ "$STATUSCODE" == "502" ]]; then
+            echo 'DOWN=true' >> $GITHUB_OUTPUT
+          else
+            echo 'DOWN=false' >> $GITHUB_OUTPUT
+          fi
+
+      - name: Teardown research_backend
+        if: steps.research-status.outputs.DOWN == 'true'
+        uses: dawidd6/action-ansible-playbook@v2
+        env:
+          APP_HOSTS: traceit-02-i.comp.nus.edu.sg
+        with:
+          playbook: playbooks/teardown_django.yml
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          options: |
+            --inventory hosts_prod.yml
+      
+      - name: Get research_backend secrets from Vault
+        if: steps.research-status.outputs.DOWN == 'true'
+        uses: hashicorp/vault-action@v2.4.0
+        id: research_backend-secrets
+        with:
+          url: https://traceit-07-i.comp.nus.edu.sg:8200
+          token: ${{ steps.secrets.outputs.VAULT_TOKEN }}
+          secrets: |
+              kv/research_backend secret_key | DJANGO_SECRET_KEY;
+              database/creds/authdb_readwrite username | POSTGRES_AUTH_USER;
+              database/creds/authdb_readwrite password | POSTGRES_AUTH_PASSWORD;
+              database/creds/researchsdb_readwrite username | POSTGRES_RESEARCH_USER;
+              database/creds/researchsdb_readwrite password | POSTGRES_RESEARCH_PASSWORD;
+          exportEnv: false
+          caCertificate: ${{ steps.secrets.outputs.VAULT_CACERT }}
+          clientCertificate: ${{ steps.secrets.outputs.VAULT_CLIENTCERT }}
+          clientKey: ${{ steps.secrets.outputs.VAULT_CLIENTKEY }}
+      
+      - name: Deploy research_backend
+        if: steps.research-status.outputs.DOWN == 'true'
+        uses: dawidd6/action-ansible-playbook@v2
+        env:
+          APP_HOSTS: traceit-02-i.comp.nus.edu.sg
+          PAT: ${{ secrets.PAT }}
+          REPOSITORY: "IFS4205-TraceIT/research-backend"
+          APP_NAME: research_backend
+          DJANGO_SECRET_KEY: "${{ steps.research_backend-secrets.outputs.DJANGO_SECRET_KEY }}"
+
+          VAULT_TOKEN: ${{ steps.secrets.outputs.VAULT_TOKEN }}
+          VAULT_ADDR: https://traceit-07-i.comp.nus.edu.sg:8200
+
+          POSTGRES_AUTH_HOST:     traceit-01-i.comp.nus.edu.sg
+          POSTGRES_AUTH_PORT:     5432
+          POSTGRES_AUTH_DB:       authdb
+          POSTGRES_AUTH_USER:     "${{ steps.research_backend-secrets.outputs.POSTGRES_AUTH_USER }}"
+          POSTGRES_AUTH_PASSWORD: "${{ steps.research_backend-secrets.outputs.POSTGRES_AUTH_PASSWORD }}"
+
+          POSTGRES_RESEARCH_HOST:          traceit-01-i.comp.nus.edu.sg
+          POSTGRES_RESEARCH_PORT:          5432
+          POSTGRES_RESEARCH_DB:            researchsdb
+          POSTGRES_RESEARCH_USER:          "${{ steps.research_backend-secrets.outputs.POSTGRES_RESEARCH_USER }}"
+          POSTGRES_RESEARCH_PASSWORD:      "${{ steps.research_backend-secrets.outputs.POSTGRES_RESEARCH_PASSWORD }}"
+
+          LOKI_PASSWD:            ${{ secrets.LOKI_PASSWD }}
+        with:
+          playbook: playbooks/deploy_django.yml
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          options: |
+            --inventory hosts_prod.yml
+      
+      ######################################
+      #            Contact API             #
+      ######################################
+
+      - name: Check if contact API is down
+        id: contact-status
+        shell: bash
+        run: |
+          STATUSCODE=$(curl -I --silent --output /dev/stderr --max-time 10 --write-out "%{http_code}"  http://traceit-04-i.comp.nus.edu.sg/contact/api/ || true)
+          if [[ "$STATUSCODE" == "502" ]]; then
+            echo 'DOWN=true' >> $GITHUB_OUTPUT
+          else
+            echo 'DOWN=false' >> $GITHUB_OUTPUT
+          fi
+
+      - name: Teardown contact_backend
+        if: steps.contact-status.outputs.DOWN == 'true'
+        uses: dawidd6/action-ansible-playbook@v2
+        env:
+          APP_HOSTS: traceit-03-i.comp.nus.edu.sg
+        with:
+          playbook: playbooks/teardown_django.yml
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          options: |
+            --inventory hosts_prod.yml
+
+      - name: Get contact_backend secrets from Vault
+        if: steps.contact-status.outputs.DOWN == 'true'
+        uses: hashicorp/vault-action@v2.4.0
+        id: contact_backend-secrets
+        with:
+          url: https://traceit-07-i.comp.nus.edu.sg:8200
+          token: ${{ steps.secrets.outputs.VAULT_TOKEN }}
+          secrets: |
+              kv/contact_backend secret_key | DJANGO_SECRET_KEY;
+              database/creds/authdb_readwrite username | POSTGRES_AUTH_USER;
+              database/creds/authdb_readwrite password | POSTGRES_AUTH_PASSWORD;
+              database/creds/maindb_readwrite username | POSTGRES_USER;
+              database/creds/maindb_readwrite password | POSTGRES_PASSWORD;
+          exportEnv: false
+          caCertificate: ${{ steps.secrets.outputs.VAULT_CACERT }}
+          clientCertificate: ${{ steps.secrets.outputs.VAULT_CLIENTCERT }}
+          clientKey: ${{ steps.secrets.outputs.VAULT_CLIENTKEY }}
+
+      - name: Deploy contact_backend
+        if: steps.contact-status.outputs.DOWN == 'true'
+        uses: dawidd6/action-ansible-playbook@v2
+        env:
+          APP_HOSTS: traceit-03-i.comp.nus.edu.sg
+          PAT: ${{ secrets.PAT }}
+          REPOSITORY: "IFS4205-TraceIT/contact-backend"
+          APP_NAME: contact_backend
+          DJANGO_SECRET_KEY: "${{ steps.contact_backend-secrets.outputs.DJANGO_SECRET_KEY }}"
+
+          VAULT_TOKEN: ${{ steps.secrets.outputs.VAULT_TOKEN }}
+          VAULT_ADDR: https://traceit-07-i.comp.nus.edu.sg:8200
+
+          POSTGRES_AUTH_HOST:     traceit-01-i.comp.nus.edu.sg
+          POSTGRES_AUTH_PORT:     5432
+          POSTGRES_AUTH_DB:       authdb
+          POSTGRES_AUTH_USER:     "${{ steps.contact_backend-secrets.outputs.POSTGRES_AUTH_USER }}"
+          POSTGRES_AUTH_PASSWORD: "${{ steps.contact_backend-secrets.outputs.POSTGRES_AUTH_PASSWORD }}"
+
+          POSTGRES_HOST:          traceit-01-i.comp.nus.edu.sg
+          POSTGRES_PORT:          5432
+          POSTGRES_DB:            maindb
+          POSTGRES_USER:          "${{ steps.contact_backend-secrets.outputs.POSTGRES_USER }}"
+          POSTGRES_PASSWORD:      "${{ steps.contact_backend-secrets.outputs.POSTGRES_PASSWORD }}"
+
+          LOKI_PASSWD:            ${{ secrets.LOKI_PASSWD }}
+        with:
+          playbook: playbooks/deploy_django.yml
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          options: |
+            --inventory hosts_prod.yml

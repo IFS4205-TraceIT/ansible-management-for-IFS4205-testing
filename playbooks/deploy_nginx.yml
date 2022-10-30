@@ -1,0 +1,77 @@
+- name: Deploy NGINX to proxy hosts
+  hosts: nginx
+  gather_facts: no
+  become: yes # Sudo as root
+
+  tasks:
+
+    - name: Update apt repository cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install NGINX
+      ansible.builtin.apt:
+        name: nginx
+        state: present
+
+    - name: Add server certificate
+      ansible.builtin.copy:
+        dest: /etc/nginx/server.crt
+        owner: root
+        group: root
+        mode: 0400
+        src: /root/server.crt
+        remote_src: yes
+
+    - name: Add server private key
+      ansible.builtin.copy:
+        dest: /etc/nginx/server.key
+        owner: root
+        group: root
+        mode: 0400
+        src: /root/server.key
+        remote_src: yes
+
+    - name: Create /tracer web directory
+      ansible.builtin.file:
+        state: directory
+        path: /var/www/tracer
+        owner: root
+        group: root
+        mode: 0755
+
+    - name: Create /research web directory
+      ansible.builtin.file:
+        state: directory
+        path: /var/www/research
+        owner: root
+        group: root
+        mode: 0755
+
+    - name: Unarchive tracer-frontend files
+      ansible.builtin.unarchive:
+        src: tracer-frontend.tar.gz
+        dest: /var/www/tracer
+
+    - name: Unarchive research-frontend files
+      ansible.builtin.unarchive:
+        src: research-frontend.tar.gz
+        dest: /var/www/research
+
+    - name: Apply config
+      ansible.builtin.copy:
+        mode: 0644
+        dest: /etc/nginx/sites-available/default
+        src: nginx/default
+
+    - name: Apply config
+      ansible.builtin.copy:
+        mode: 0644
+        dest: /etc/nginx/nginx.conf
+        src: nginx/nginx.conf
+
+    - name: Reload NGINX
+      ansible.builtin.systemd:
+        name: nginx.service
+        state: reloaded

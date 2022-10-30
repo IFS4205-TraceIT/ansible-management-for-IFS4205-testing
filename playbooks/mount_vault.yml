@@ -1,0 +1,89 @@
+- name: Mount secret engines
+  hosts: vault
+  gather_facts: no
+  become: yes
+  become_user: vault
+
+  environment:
+    VAULT_TOKEN: "{{ lookup('ansible.builtin.env', 'VAULT_TOKEN') }}"
+    VAULT_ADDR: "https://traceit-07-i.comp.nus.edu.sg:8200"
+    VAULT_CLIENT_CERT: /opt/vault/tls/tls.crt
+    VAULT_CLIENT_KEY: /opt/vault/tls/tls.key
+    VAULT_CACERT: /usr/local/share/ca-certificates/traceit-ca.crt
+
+  tasks:
+
+    - name: Enable TOTP Secrets Engine
+      ansible.builtin.command:
+        argv:
+          - vault
+          - secrets
+          - enable
+          - totp
+      ignore_errors: yes
+
+    - name: Enable Database Secrets Engine
+      ansible.builtin.command:
+        argv:
+          - vault
+          - secrets
+          - enable
+          - database
+      ignore_errors: yes
+    
+    - name: Enable KV Secrets Engine
+      ansible.builtin.command:
+        argv:
+          - vault
+          - secrets
+          - enable
+          - kv
+      ignore_errors: yes
+
+    - name: Enable KV V2 Secrets Engine
+      ansible.builtin.command:
+        argv:
+          - vault
+          - secrets
+          - enable
+          - -path=secret
+          - kv-v2
+      ignore_errors: yes
+    
+    - name: Enable PKI Secrets Engine for Root CA
+      ansible.builtin.command:
+        argv:
+          - vault
+          - secrets
+          - enable
+          - pki
+      ignore_errors: yes
+
+    - name: Enable PKI Secrets Engine for Intermediate CA
+      ansible.builtin.command:
+        argv:
+          - vault
+          - secrets
+          - enable
+          - -path=pki_int
+          - pki
+      ignore_errors: yes
+
+    - name: Generate totp-only policy
+      ansible.builtin.shell: |
+        vault policy write totp-only - <<EOF
+        path "totp/keys/*" {
+          capabilities = ["create", "read", "update", "delete"]
+        }
+        path "totp/code/*" {
+          capabilities = ["create", "read", "update", "delete"]
+        }
+        EOF
+
+    - name: Generate tempid-only policy
+      ansible.builtin.shell: |
+        vault policy write tempid-only - <<EOF
+        path "secret/data/contacts/temp_id_key" {
+          capabilities = ["create", "read", "update"]
+        }
+        EOF

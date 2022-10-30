@@ -1,0 +1,49 @@
+- name: Configure Vault to use newly-generated TLS certificate
+  hosts: vault
+  gather_facts: no
+  become: yes  
+  
+  tasks:
+
+    - name: Update Vault server certificate
+      become: yes
+      become_user: vault
+      ansible.builtin.copy:
+        src: /home/vault/server.crt
+        dest: /opt/vault/tls/tls.crt
+        remote_src: yes
+    
+    - name: Update Vault server private key
+      become: yes
+      become_user: vault
+      ansible.builtin.copy:
+        src: /home/vault/server.key
+        dest: /opt/vault/tls/tls.key
+        remote_src: yes
+
+    - name: Update configuration file to hardened version
+      become: yes
+      become_user: vault
+      ansible.builtin.copy:
+        src: vault/vault.hcl
+        dest: /etc/vault.d/vault.hcl
+
+    - name: Restart vault service
+      ansible.builtin.systemd:
+        name: vault
+        enabled: yes
+        state: restarted
+
+    - name: Unseal vault
+      ansible.builtin.uri:
+        url: "https://traceit-07-i.comp.nus.edu.sg:8200/v1/sys/unseal"
+        method: POST
+        body:
+          key: "{{ lookup('ansible.builtin.env', 'UNSEAL_KEY') }}"
+        body_format: json
+        headers:
+          Content-Type: "application/json"
+        validate_certs: no
+        ca_path: /usr/local/share/ca-certificates/traceit-ca.crt
+        client_cert: /opt/vault/tls/tls.crt
+        client_key: /opt/vault/tls/tls.key

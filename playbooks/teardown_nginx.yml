@@ -1,0 +1,42 @@
+- name: Teardown NGINX from proxy hosts
+  hosts: nginx
+  gather_facts: no
+  become: yes # Sudo as root
+
+  tasks:
+
+    - name: Stop NGINX
+      ansible.builtin.systemd:
+        name: nginx.service
+        state: stopped
+
+    - name: Remove /tracer web directory
+      ansible.builtin.file:
+        state: absent
+        path: /var/www/tracer
+
+    - name: Remove /research web directory
+      ansible.builtin.file:
+        state: absent
+        path: /var/www/research
+
+    - name: Find log files
+      ansible.builtin.find:
+        paths: "/var/log/nginx"
+        hidden: True
+        recurse: True
+      register: collected_files
+    
+    - name: Delete logs
+      ansible.builtin.file:
+        state: absent
+        path: "{{ item.path }}"
+      with_items: "{{ collected_files.files }}"
+
+    - name: Remove cert
+      ansible.builtin.file:
+        state: absent
+        path: "{{ item }}"
+      loop:
+        - /etc/nginx/server.key
+        - /etc/nginx/server.crt
